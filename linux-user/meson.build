@@ -20,6 +20,7 @@ linux_user_ss.add(files(
   'thunk.c',
   'uaccess.c',
   'uname.c',
+  'ltrace.c'
 ))
 linux_user_ss.add(rt)
 linux_user_ss.add(libdw)

@@ -1011,6 +1011,9 @@ int main(int argc, char **argv, char **envp)
     qemu_semihosting_guestfd_init();
 #endif
 
+    // qemu_log("Right before cpu loop!\n");
+    // qemu_log("load_addr=%lx, entry_point=%lx\n", info->load_addr, info->entry);
+    // qemu_log("filename=%s\n", bprm.filename);
     cpu_loop(env);
     /* never exits */
     return 0;

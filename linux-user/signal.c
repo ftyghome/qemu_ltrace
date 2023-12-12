@@ -33,6 +33,9 @@
 #include "host-signal.h"
 #include "user/safe-syscall.h"
 
+#include "ltrace.h"
+#include "qemu/qht.h"
+
 static struct target_sigaction sigact_table[TARGET_NSIG];
 
 static void host_signal_handler(int host_signum, siginfo_t *info,
@@ -1025,21 +1028,94 @@ int do_sigaction(int sig, const struct target_sigaction *act,
     return ret;
 }
 
+extern struct qht *hasht, *hashpc, *hashret;
+extern uint64_t interp_bl_target(uint32_t inst, uint64_t pc);
+vaddr last_disabled_bp_addr = 0;
+bool last_disabled_bp_is_call = 0;
+const char* last_disabled_bp_name = NULL;
+
+static const char *lookup_qht(struct qht *table,vaddr pc) {
+    struct plt_stub stub, *real_stub;
+    stub.addr = pc;
+    if (qht_lookup(table, &stub, stub.addr)) {
+        qht_insert(table, &stub, stub.addr, (void **)&real_stub);
+    } else {
+        return NULL;
+    }
+    return real_stub->name;
+}
+
 static void handle_pending_signal(CPUArchState *cpu_env, int sig,
                                   struct emulated_sigtable *k)
 {
+
+    // static int CALL_TIME = 0;
     CPUState *cpu = env_cpu(cpu_env);
     abi_ulong handler;
     sigset_t set;
     target_sigset_t target_old_set;
     struct target_sigaction *sa;
     TaskState *ts = cpu->opaque;
-
+    // qemu_log("*%d* HANDLING SIGNAL %d\n",CALL_TIME++,sig);
     trace_user_handle_signal(cpu_env, sig);
     /* dequeue signal */
     k->pending = 0;
-
+    // qemu_log("*%d* BEFORE GDB HANDLING SIGNAL %d\n",CALL_TIME,sig);
     sig = gdb_handlesig(cpu, sig);
+    if (sig == 5) {
+        sig = 0;
+    // check last disabled breakpoint
+        if (last_disabled_bp_addr != 0) {
+            if (last_disabled_bp_is_call) {
+                // qemu_log("we have passed a call bp! current x30 is %lx\n", cpu_env->xregs[30]);
+                struct plt_stub *stub = g_try_malloc(sizeof(struct plt_stub));
+#if defined(TARGET_AARCH64)
+                stub->addr = cpu_env->xregs[30];
+#endif
+#if defined(TARGET_RISCV)
+                stub->addr = cpu_env->gpr[1];
+#endif
+                stub->name = last_disabled_bp_name;
+                // maintain the [hashret], because we know the return addr now.
+                qht_insert(hashret, stub, stub->addr, NULL);
+                cpu_breakpoint_insert(cpu, stub->addr, BP_GDB, NULL);
+            }
+            cpu_breakpoint_insert(cpu, last_disabled_bp_addr, BP_GDB, NULL);
+            last_disabled_bp_addr = 0;
+            last_disabled_bp_name = NULL;
+            last_disabled_bp_is_call = false;
+        }
+    // handle situation 1: current inst is a ret inst from dynamic library (note: a inst can both be in situation 1 and 2)
+        const char *symbol_name_ret = lookup_qht(hashret,cpu_env->pc);
+        if (symbol_name_ret != NULL) {
+#if defined(TARGET_AARCH64)
+            // qemu_log("return from symbol! [%s], [X0]=%lx\n", symbol_name_ret,cpu_env->xregs[0]);
+#endif
+#if defined(TARGET_RISCV)
+            // qemu_log("return from symbol! [%s], [RA]=%lx\n", symbol_name_ret, cpu_env->gpr[1]);
+#endif
+            ltrace_handle_symbol(symbol_name_ret, cpu_env,true);
+            cpu_breakpoint_remove(cpu, cpu_env->pc, BP_GDB);
+            last_disabled_bp_addr = cpu_env->pc;
+            last_disabled_bp_name = symbol_name_ret;
+            last_disabled_bp_is_call = false; // this can be overwritten, if the inst is both in
+                                              // situation 1 and 2.
+        }
+    // handle situation 2: current inst is a call inst to dynamic library
+        const char *symbol_name_call = lookup_qht(hashpc,cpu_env->pc);
+        if (symbol_name_call != NULL) {
+            // qemu_log("Stopped at symbol! [%s]\n", symbol_name);
+            ltrace_handle_symbol(symbol_name_call, cpu_env,false);
+            cpu_breakpoint_remove(cpu, cpu_env->pc, BP_GDB);
+            last_disabled_bp_addr = cpu_env->pc;
+            last_disabled_bp_name = symbol_name_call;
+            last_disabled_bp_is_call = true;
+        }
+    // check if we should single step the cpu, so the next step can re-insert the breakpoint
+        if (last_disabled_bp_addr != 0)
+            cpu_single_step(cpu, true);
+        else cpu_single_step(cpu, false);
+       }
     if (!sig) {
         sa = NULL;
         handler = TARGET_SIG_IGN;

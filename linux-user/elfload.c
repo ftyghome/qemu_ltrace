@@ -6,6 +6,7 @@
 #include <sys/shm.h>
 
 #include "qemu.h"
+#include "qemu/qht.h"
 #include "user-internals.h"
 #include "signal-common.h"
 #include "loader.h"
@@ -705,6 +706,7 @@ static uint32_t get_elf_hwcap(void)
 
     return hwcaps;
 }
+
 
 static uint32_t get_elf_hwcap2(void)
 {
@@ -2049,6 +2051,7 @@ static inline void bswap_mips_abiflags(Mips_elf_abiflags_v0 *abiflags) { }
 static int elf_core_dump(int, const CPUArchState *);
 #endif /* USE_ELF_CORE_DUMP */
 static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias);
+static void load_sections(struct elfhdr *hdr, int fd, abi_ulong load_bias);
 
 /* Verify the portions of EHDR within E_IDENT for the target.
    This can be performed before bswapping the entire header.  */
@@ -3250,6 +3253,11 @@ static void load_elf_image(const char *image_name, int image_fd,
             vaddr_ef = vaddr + eppnt->p_filesz;
             vaddr_em = vaddr + eppnt->p_memsz;
 
+            if (elf_prot & prot_exec) {
+                qemu_log("image name: %s; loading ehdr %lx, length %lx\n",
+                         image_name, vaddr_ps, eppnt->p_filesz + vaddr_po);
+            }
+
             /*
              * Some segments may be completely empty, with a non-zero p_memsz
              * but no backing file segment.
@@ -3278,6 +3286,11 @@ static void load_elf_image(const char *image_name, int image_fd,
                     info->end_code = vaddr_ef;
                 }
             }
+
+            // qemu_log("code section %lx ~ %lx\n",info->start_code, info->end_code);
+            // qemu_log("orig %lx ~ %lx\n", info->start_code - info->load_bias,
+                    //  info->end_code - info->load_bias);
+
             if (elf_prot & PROT_WRITE) {
                 if (vaddr < info->start_data) {
                     info->start_data = vaddr;
@@ -3317,6 +3330,8 @@ static void load_elf_image(const char *image_name, int image_fd,
     if (qemu_log_enabled()) {
         load_symbols(ehdr, image_fd, load_bias);
     }
+
+    load_sections(ehdr, image_fd, load_bias);
 
     debuginfo_report_elf(image_name, image_fd, load_bias);
 
@@ -3408,6 +3423,263 @@ static int symcmp(const void *s0, const void *s1)
     return (sym0->st_value < sym1->st_value)
         ? -1
         : ((sym0->st_value > sym1->st_value) ? 1 : 0);
+}
+
+#include "ltrace.h"
+
+struct ltraceinfos {
+    struct elf_shdr text_shdr, rela_plt_shdr, dynsym_shdr, dynstr_shdr,
+        plt_shdr;
+    char *text_content, *rela_plt_content, *dynsym_content, *dynstr_content;
+    struct plt_stub *plt_stubs;
+    int plt_ents;
+};
+
+struct ltraceinfos ltraceinfo;
+
+// For every call instruction,
+//  hasht stores    [offset(file) -> func name];
+//  hashpc stores   [inst addr(loaded in memory) -> func name];
+//  hashret stores  [return addr(loaded in memory) -> func name].It is usually
+//  the addr[inst] + 4, we choose to obtain it in runtime, by reading the reg after the call completes)
+struct qht *hasht = NULL, *hashpc = NULL, *hashret = NULL;
+
+// interprets a call instruction, returns the call target.
+static uint64_t interp_bl_target(uint32_t inst, uint64_t pc) {
+
+#ifdef TARGET_AARCH64
+    uint64_t addr = inst & 0x03ffffff;
+    if (addr >> 25)
+        addr |= 0xfffffffffc000000;
+    return pc+addr*4;
+#endif
+    
+#ifdef TARGET_RISCV
+    uint64_t addr = 0;
+    addr |= ((inst >> 12) & 0xff) << 12;
+    addr |= ((inst >> 20) & 0x1) << 11;
+    addr |= ((inst >> 21) & 0x3ff) << 1;
+    addr |= ((inst >> 31) & 0x1) << 20;
+    if (addr >> 20)
+        addr |= 0xfffffffffff00000;
+    return pc + addr;
+#endif
+}
+
+
+#ifdef TARGET_AARCH64
+
+#define BL_INST_CHECK ((inst >> 26) == 0b100101)
+#define INST_INCR (4)
+#define INST_UNASSOC (false)
+
+#endif
+
+#ifdef TARGET_RISCV
+
+#define BL_INST_CHECK ((inst & 0b111111111111) == 0b000011101111)
+#define INST_INCR (((buf_raw[i] & 0b11) == 0b11) ? 4 : 2)
+#define INST_UNASSOC (buf_raw[i] & 0b11) != 0b11
+
+#endif
+
+// search for call instructions, and add breakpoint in cpu.
+static void find_callinst(char *text, struct ltraceinfos *ltraceinfo, abi_ulong load_bias) {
+    typeof(ltraceinfo->text_shdr.sh_size) size = ltraceinfo->text_shdr.sh_size;
+
+    uint8_t *buf_raw = (uint8_t *)text;
+    uint32_t inst;
+
+    for (int i = 0; i < size; i += INST_INCR) {
+        if(INST_UNASSOC) continue;
+        inst = *(uint32_t *)(buf_raw + i);
+        // first check if it is a call inst
+        if (BL_INST_CHECK){
+            elf_addr_t bl_target =
+                interp_bl_target(inst, ltraceinfo->text_shdr.sh_addr + i);
+            
+            // [stub] is sent for hash table search,
+            // [real_stub] is the mapping from file offset to symbol name,
+            // [stub_pc_based] is the mapping from pc to symbol name
+            struct plt_stub stub, *stub_pc_based, *real_stub;
+            stub.addr = bl_target + load_bias;
+            if (qht_lookup(hasht, &stub, stub.addr)) {
+                stub_pc_based = g_try_malloc(sizeof(struct plt_stub));
+                stub_pc_based->addr = load_bias + ltraceinfo->text_shdr.sh_addr + i;
+                // actually we are NOT inserting anything to the [hasht]!
+                // the "qht_insert" is used for lookup the [real_stub].
+                qht_insert(hasht, &stub, stub.addr, (void **)&real_stub);
+                stub_pc_based->name = real_stub->name;
+                // maintain the [hashpc] here.
+                qht_insert(hashpc, stub_pc_based, stub_pc_based->addr, NULL);
+                qemu_log("(%lx) inst: %8x branching to %8lx named %s; adding "
+                         "breakpoint to %lx\n",
+                         ltraceinfo->text_shdr.sh_addr + i, inst, bl_target,
+                         real_stub->name,
+                         load_bias + ltraceinfo->text_shdr.sh_addr + i);
+                // insert cpu breakpoint, for every call inst that we are interested.
+                cpu_breakpoint_insert(thread_cpu,
+                                          load_bias+ltraceinfo->text_shdr.sh_addr + i,
+                                      BP_GDB, NULL);
+            }
+        }
+    }
+}
+
+// get name from .dynstr section
+static const char* get_dyn_name(const struct ltraceinfos *ltraceinfo, int idx) {
+    struct elf_sym *dynsym_content = (struct elf_sym *)ltraceinfo->dynsym_content;
+    int nameidx = dynsym_content[idx].st_name;
+
+    const char *dynstr_content = ltraceinfo->dynstr_content;
+    return dynstr_content + nameidx;
+}
+
+static bool cmp_elfaddr(const void *a, const void *b) {
+    return ((struct plt_stub *)a)->addr == ((struct plt_stub *)b)->addr;
+}
+
+// Find .plt section. For every plt entry, find the mapping from offset in file
+// to the symbol name, then fill the mapping to the [hasht]
+static void find_plt(struct ltraceinfos *ltraceinfo, abi_ulong load_bias) {
+
+    const struct elf_shdr *shdr  = &ltraceinfo->rela_plt_shdr;
+    const char *content_ = ltraceinfo->rela_plt_content;
+    struct elf_rela *content = (struct elf_rela *)content_;
+    int entsize = shdr->sh_size / shdr->sh_entsize;
+    ltraceinfo->plt_stubs = g_try_malloc(sizeof(struct plt_stub) * entsize);
+    int plt_ents = ltraceinfo->plt_ents = shdr->sh_size / shdr->sh_entsize;
+
+    elf_addr_t addr = ltraceinfo->plt_shdr.sh_addr;
+    addr += 0x20; // skipping the 0x20 for the beginning of plt
+
+    if(hasht == NULL){
+        hasht = g_try_malloc(sizeof(struct qht));
+        qht_init(hasht, cmp_elfaddr, plt_ents, 0);
+    }
+
+    if (hashpc == NULL) {
+        hashpc = g_try_malloc(sizeof(struct qht));
+        qht_init(hashpc, cmp_elfaddr, plt_ents, 0);
+    }
+
+    if (hashret == NULL) {
+        hashret = g_try_malloc(sizeof(struct qht));
+        qht_init(hashret, cmp_elfaddr, plt_ents, 0);
+    }
+
+    for (int i = 0; i < plt_ents; i++) {
+        ltraceinfo->plt_stubs[i].name =
+            get_dyn_name(ltraceinfo, content[i].r_info >> 32);
+
+        ltraceinfo->plt_stubs[i].addr = addr + load_bias;
+
+        qemu_log("plt addr %lx -> %s\n", ltraceinfo->plt_stubs[i].addr,
+                 ltraceinfo->plt_stubs[i].name);
+
+        qht_insert(hasht, &ltraceinfo->plt_stubs[i],
+                   ltraceinfo->plt_stubs[i].addr, NULL);
+
+        addr += 0x10; // every plt entry is of size 0x10! (afaik for aarch64 and riscv64)
+    }
+}
+
+static bool load_section_content(int fd, struct elf_shdr *shdr, char **buf) {
+    *buf = g_try_malloc(shdr->sh_size);
+    if(*buf == NULL) return false;
+    if (pread(fd, *buf, shdr->sh_size, shdr->sh_offset) != shdr->sh_size) {
+        return false;
+    }
+    return true;
+}
+
+static void load_sections(struct elfhdr *hdr, int fd, abi_ulong load_bias) {
+    int i, shnum;
+    uint64_t segsz;
+    struct elf_shdr *shdr;
+
+    char *strings = NULL;
+
+    shnum = hdr->e_shnum;
+    i = shnum * sizeof(struct elf_shdr);
+    shdr = (struct elf_shdr *)g_try_malloc(i);
+    if (pread(fd, shdr, i, hdr->e_shoff) != i) {
+        return;
+    }
+
+    qemu_log("Load bias = %lx\n",load_bias);
+
+    bswap_shdr(shdr, shnum);
+
+    int shstrndx = hdr->e_shstrndx, textndx = -1, relapltndx = -1, dynsymndx = -1, dynstrndx = -1, pltndx = -1;
+
+    segsz = shdr[shstrndx].sh_size;
+
+    strings = g_try_malloc(segsz);
+    if (pread(fd, strings, segsz, shdr[shstrndx].sh_offset) != segsz) {
+        goto give_up;
+    }
+
+
+    for (int i = 0; i < shnum; i++) {
+        if (!strcmp(strings + shdr[i].sh_name, ".text")) {
+            textndx = i;
+        }
+        if (!strcmp(strings + shdr[i].sh_name, ".rela.plt")) {
+            relapltndx = i;
+            if(shdr[i].sh_link == 0) goto give_up;
+            dynsymndx = shdr[i].sh_link;
+        }
+        if (!strcmp(strings + shdr[i].sh_name, ".plt")) {
+            pltndx = i;
+        }
+    }
+    if (shdr[dynsymndx].sh_link == 0)
+        goto give_up;
+    dynstrndx = shdr[dynsymndx].sh_link;
+
+    if(textndx == -1 || relapltndx == -1 || pltndx == -1) goto give_up;
+
+    
+
+    ltraceinfo.text_shdr = shdr[textndx];
+    ltraceinfo.rela_plt_shdr = shdr[relapltndx];
+    ltraceinfo.dynsym_shdr = shdr[dynsymndx];
+    ltraceinfo.dynstr_shdr = shdr[dynstrndx];
+    ltraceinfo.plt_shdr = shdr[pltndx];
+
+    // qemu_log("textndx: %d, rela.pltndx %d, dynsym %d, dynstr %d\n", textndx, relapltndx,dynsymndx, dynstrndx);
+
+    // qemu_log(".text addr: [%lx~%lx]; off: [%lx~%lx]\n",
+            //  ltraceinfo.text_shdr.sh_addr,
+            //  ltraceinfo.text_shdr.sh_addr + ltraceinfo.text_shdr.sh_size,
+            //  ltraceinfo.text_shdr.sh_offset,
+            //  ltraceinfo.text_shdr.sh_offset + ltraceinfo.text_shdr.sh_size);
+
+    if (!load_section_content(fd, &ltraceinfo.text_shdr,
+                              &ltraceinfo.text_content))
+        goto give_up;
+
+    // qemu_log("loading rela %lx %lx\n", ltraceinfo.rela_plt_shdr.sh_offset,
+            //  ltraceinfo.rela_plt_shdr.sh_size);
+    if (!load_section_content(fd, &ltraceinfo.rela_plt_shdr,
+                              &ltraceinfo.rela_plt_content))
+        goto give_up;
+
+    if (!load_section_content(fd, &ltraceinfo.dynsym_shdr,
+                              &ltraceinfo.dynsym_content)) 
+        goto give_up;
+        
+    if (!load_section_content(fd, &ltraceinfo.dynstr_shdr,
+                              &ltraceinfo.dynstr_content))
+        goto give_up;
+
+    find_plt(&ltraceinfo, load_bias);
+    find_callinst(ltraceinfo.text_content, &ltraceinfo,load_bias);
+    return;
+
+give_up:
+    return;
 }
 
 /* Best attempt to load symbols from this ELF object. */
