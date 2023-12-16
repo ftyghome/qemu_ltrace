@@ -3512,11 +3512,11 @@ static void find_callinst(char *text, struct ltraceinfos *ltraceinfo, abi_ulong 
                 stub_pc_based->name = real_stub->name;
                 // maintain the [hashpc] here.
                 qht_insert(hashpc, stub_pc_based, stub_pc_based->addr, NULL);
-                qemu_log("(%lx) inst: %8x branching to %8lx named %s; adding "
-                         "breakpoint to %lx\n",
-                         ltraceinfo->text_shdr.sh_addr + i, inst, bl_target,
-                         real_stub->name,
-                         load_bias + ltraceinfo->text_shdr.sh_addr + i);
+                // qemu_log("(%lx) inst: %8x branching to %8lx named %s; adding "
+                //          "breakpoint to %lx\n",
+                //          ltraceinfo->text_shdr.sh_addr + i, inst, bl_target,
+                //          real_stub->name,
+                //          load_bias + ltraceinfo->text_shdr.sh_addr + i);
                 // insert cpu breakpoint, for every call inst that we are interested.
                 cpu_breakpoint_insert(thread_cpu,
                                           load_bias+ltraceinfo->text_shdr.sh_addr + i,
@@ -3574,8 +3574,8 @@ static void find_plt(struct ltraceinfos *ltraceinfo, abi_ulong load_bias) {
 
         ltraceinfo->plt_stubs[i].addr = addr + load_bias;
 
-        qemu_log("plt addr %lx -> %s\n", ltraceinfo->plt_stubs[i].addr,
-                 ltraceinfo->plt_stubs[i].name);
+        // qemu_log("plt addr %lx -> %s\n", ltraceinfo->plt_stubs[i].addr,
+        //          ltraceinfo->plt_stubs[i].name);
 
         qht_insert(hasht, &ltraceinfo->plt_stubs[i],
                    ltraceinfo->plt_stubs[i].addr, NULL);
